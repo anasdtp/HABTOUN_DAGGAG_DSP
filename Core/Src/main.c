@@ -76,6 +76,8 @@ static arm_fir_instance_q15 firQ15;
 
 static volatile uint8_t adcHalfReady = 0U;
 static volatile uint8_t adcFullReady = 0U;
+static volatile uint16_t inSWV = 0U;
+static volatile uint16_t outSWV = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -138,6 +140,9 @@ static void process_audio_block(uint32_t offset)
     }
     dac12bit[offset + i] = (uint16_t)y;
   }
+
+  inSWV = adc12bit[offset];
+  outSWV = dac12bit[offset];
 }
 
 /* USER CODE END 0 */
