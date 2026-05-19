@@ -7,6 +7,20 @@
 - Taille de bloc: 128 echantillons
 - Frequence CPU: 168 MHz
 
+Micro (PA0)
+    ↓
+ADC1 — déclenché par TIM2 TRGO (8 kHz)
+    ↓  DMA2 Stream0 (circulaire)
+adc12bit[256] ← buffer circulaire double
+    ↓  CPU traite pendant que DMA continue
+arm_fir_fast_q15()
+    ↓
+dac12bit[256] ← buffer circulaire double
+    ↓  DMA1 Stream5 (circulaire)
+DAC CH1 — déclenché par TIM2 TRGO
+    ↓
+Haut-parleur (PA4)
+
 == Mesures brutes (debug)
 - firCyclesLast = 9962 cycles
 - firCyclesPerSample = 77 cycles/ech
