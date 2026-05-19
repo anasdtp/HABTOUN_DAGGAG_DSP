@@ -78,6 +78,18 @@ static volatile uint8_t adcHalfReady = 0U;
 static volatile uint8_t adcFullReady = 0U;
 static volatile uint16_t inSWV = 0U;
 static volatile uint16_t outSWV = 0U;
+
+static volatile uint32_t firCyclesLast = 0U;
+static volatile uint32_t firCyclesMin = 0xFFFFFFFFU;
+static volatile uint32_t firCyclesMax = 0U;
+static volatile uint32_t firCyclesPerSample = 0U;
+static volatile uint32_t firUsecPerBlock = 0U;
+static volatile uint64_t firCyclesSum = 0U;
+static volatile uint32_t firBlocks = 0U;
+
+static volatile uint32_t sampleRateHz = 0U;
+static volatile uint32_t firGroupDelaySamples = 0U;
+static volatile uint32_t firGroupDelayUs = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -90,11 +102,56 @@ static void MX_DAC_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
+static void init_dwt_cycle_counter(void);
+static uint32_t get_tim2_update_hz(void);
+static void update_fir_timing(uint32_t cycles);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void init_dwt_cycle_counter(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static uint32_t get_tim2_update_hz(void)
+{
+  uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
+  uint32_t timclk = pclk1;
+
+  if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1)
+  {
+    timclk = pclk1 * 2U;
+  }
+
+  return timclk / ((htim2.Init.Prescaler + 1U) * (htim2.Init.Period + 1U));
+}
+
+static void update_fir_timing(uint32_t cycles)
+{
+  firCyclesLast = cycles;
+  if (cycles < firCyclesMin)
+  {
+    firCyclesMin = cycles;
+  }
+  if (cycles > firCyclesMax)
+  {
+    firCyclesMax = cycles;
+  }
+
+  firCyclesSum += cycles;
+  firBlocks++;
+
+  firCyclesPerSample = cycles / AUDIO_BLOCK_SIZE;
+  if (SystemCoreClock != 0U)
+  {
+    firUsecPerBlock = (uint32_t)((cycles * 1000000ULL) / SystemCoreClock);
+  }
+}
+
 static void process_audio_block(uint32_t offset)
 {
   uint32_t i;
@@ -115,7 +172,10 @@ static void process_audio_block(uint32_t offset)
     firInputQ15[i] = (q15_t)q15;
   }
 
+  uint32_t startCycles = DWT->CYCCNT;
   arm_fir_fast_q15(&firQ15, firInputQ15, firOutputQ15, AUDIO_BLOCK_SIZE);
+  uint32_t endCycles = DWT->CYCCNT;
+  update_fir_timing(endCycles - startCycles);
 
   for (i = 0; i < AUDIO_BLOCK_SIZE; i++)
   {
@@ -185,6 +245,15 @@ int main(void)
   /* USER CODE BEGIN 2 */
   arm_float_to_q15((float32_t *)firCoeffs32, firCoeffsQ15, NUM_TAPS);
   arm_fir_init_q15(&firQ15, NUM_TAPS, firCoeffsQ15, firStateQ15, AUDIO_BLOCK_SIZE);
+
+  init_dwt_cycle_counter();
+
+  sampleRateHz = get_tim2_update_hz();
+  firGroupDelaySamples = (NUM_TAPS - 1U) / 2U;
+  if (sampleRateHz != 0U)
+  {
+    firGroupDelayUs = (firGroupDelaySamples * 1000000U) / sampleRateHz;
+  }
 
   for (uint32_t i = 0; i < AUDIO_DMA_BUFFER_SIZE; i++)
   {
