@@ -31,12 +31,18 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define AUDIO_BLOCK_SIZE 128U
+#define AUDIO_BLOCK_SIZE     128U
 #define AUDIO_DMA_BUFFER_SIZE (AUDIO_BLOCK_SIZE * 2U)
-#define NUM_TAPS 29U
-#define ADC_CENTER_12BIT 2048
-#define ADC_TO_Q15_SHIFT 4
-#define INPUT_GUARD_BITS 5U
+
+/* CORRECTION 1 : arm_fir_fast_q15 exige NUM_TAPS multiple de 4.
+   29 n'est pas multiple de 4 → HardFault garanti.
+   On passe à 32 et on pad les coefficients avec des zéros. */
+#define NUM_TAPS             32U
+
+#define ADC_CENTER_12BIT     2048
+#define ADC_TO_Q15_SHIFT     4
+#define INPUT_GUARD_BITS     5U
+#define VOICE_THRESHOLD_Q15  400
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,25 +64,37 @@ UART_HandleTypeDef huart3;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
-static uint16_t adc12bit[AUDIO_DMA_BUFFER_SIZE];
-static uint16_t dac12bit[AUDIO_DMA_BUFFER_SIZE];
+__attribute__((aligned(4))) static uint16_t adc12bit[AUDIO_DMA_BUFFER_SIZE];
+__attribute__((aligned(4))) static uint16_t dac12bit[AUDIO_DMA_BUFFER_SIZE];
 
-static q15_t firStateQ15[AUDIO_BLOCK_SIZE + NUM_TAPS - 1U];
-static q15_t firInputQ15[AUDIO_BLOCK_SIZE];
-static q15_t firOutputQ15[AUDIO_BLOCK_SIZE];
+/* CORRECTION 2 : firStateQ15 doit avoir une taille paire.
+   (AUDIO_BLOCK_SIZE + NUM_TAPS - 1) = 128 + 32 - 1 = 159 → impair.
+   On arrondit au prochain entier pair avec (... + 1U) & ~1U → 160. */
+__attribute__((aligned(4))) static q15_t firStateQ15[((AUDIO_BLOCK_SIZE + NUM_TAPS - 1U) + 1U) & ~1U];
 
+__attribute__((aligned(4))) static q15_t firInputQ15[AUDIO_BLOCK_SIZE];
+__attribute__((aligned(4))) static q15_t firOutputQ15[AUDIO_BLOCK_SIZE];
+
+/* CORRECTION 3 : tableau padé à 32 coefficients (3 zéros ajoutés en fin).
+   Le filtre passe-bas reste identique ; les taps supplémentaires valent 0. */
 static const float32_t firCoeffs32[NUM_TAPS] = {
-  -0.0018225230f, -0.0015879294f, +0.0000000000f, +0.0036977508f, +0.0080754303f, +0.0085302217f, -0.0000000000f, -0.0173976984f,
-  -0.0341458607f, -0.0333591565f, +0.0000000000f, +0.0676308395f, +0.1522061835f, +0.2229246956f, +0.2504960933f, +0.2229246956f,
-  +0.1522061835f, +0.0676308395f, +0.0000000000f, -0.0333591565f, -0.0341458607f, -0.0173976984f, -0.0000000000f, +0.0085302217f,
-  +0.0080754303f, +0.0036977508f, +0.0000000000f, -0.0015879294f, -0.0018225230f};
+  -0.0018225230f, -0.0015879294f, +0.0000000000f, +0.0036977508f,
+  +0.0080754303f, +0.0085302217f, -0.0000000000f, -0.0173976984f,
+  -0.0341458607f, -0.0333591565f, +0.0000000000f, +0.0676308395f,
+  +0.1522061835f, +0.2229246956f, +0.2504960933f, +0.2229246956f,
+  +0.1522061835f, +0.0676308395f, +0.0000000000f, -0.0333591565f,
+  -0.0341458607f, -0.0173976984f, -0.0000000000f, +0.0085302217f,
+  +0.0080754303f, +0.0036977508f, +0.0000000000f, -0.0015879294f,
+  -0.0018225230f,
+   0.0f, 0.0f, 0.0f   /* padding pour atteindre NUM_TAPS = 32 */
+};
 
-static q15_t firCoeffsQ15[NUM_TAPS];
+__attribute__((aligned(4))) static q15_t firCoeffsQ15[NUM_TAPS];
 static arm_fir_instance_q15 firQ15;
 
-static volatile uint8_t adcHalfReady = 0U;
-static volatile uint8_t adcFullReady = 0U;
-static volatile uint16_t inSWV = 0U;
+static volatile uint8_t  adcHalfReady = 0U;
+static volatile uint8_t  adcFullReady = 0U;
+static volatile uint16_t inSWV  = 0U;
 static volatile uint16_t outSWV = 0U;
 /* USER CODE END PV */
 
@@ -87,8 +105,8 @@ static void MX_DMA_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_DAC_Init(void);
-static void MX_TIM2_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -117,32 +135,63 @@ static void process_audio_block(uint32_t offset)
 
   arm_fir_fast_q15(&firQ15, firInputQ15, firOutputQ15, AUDIO_BLOCK_SIZE);
 
-  for (i = 0; i < AUDIO_BLOCK_SIZE; i++)
   {
-    int32_t y = (int32_t)firOutputQ15[i] << INPUT_GUARD_BITS;
-    if (y > 32767)
+    uint32_t sum = 0U;
+
+    for (i = 0; i < AUDIO_BLOCK_SIZE; i++)
     {
-      y = 32767;
-    }
-    else if (y < -32768)
-    {
-      y = -32768;
+      int32_t v = firOutputQ15[i];
+      if (v < 0)
+      {
+        v = -v;
+      }
+      sum += (uint32_t)v;
+
+      int32_t y = (int32_t)firOutputQ15[i] << INPUT_GUARD_BITS;
+      if (y > 32767)
+      {
+        y = 32767;
+      }
+      else if (y < -32768)
+      {
+        y = -32768;
+      }
+
+      y = (y >> ADC_TO_Q15_SHIFT) + ADC_CENTER_12BIT;
+      if (y > 4095)
+      {
+        y = 4095;
+      }
+      else if (y < 0)
+      {
+        y = 0;
+      }
+      dac12bit[offset + i] = (uint16_t)y;
     }
 
-    y = (y >> ADC_TO_Q15_SHIFT) + ADC_CENTER_12BIT;
-    if (y > 4095)
+    if ((sum / AUDIO_BLOCK_SIZE) > VOICE_THRESHOLD_Q15)
     {
-      y = 4095;
+      HAL_GPIO_WritePin(GPIOB, LD2_Pin, GPIO_PIN_SET);
     }
-    else if (y < 0)
+    else
     {
-      y = 0;
+      HAL_GPIO_WritePin(GPIOB, LD2_Pin, GPIO_PIN_RESET);
     }
-    dac12bit[offset + i] = (uint16_t)y;
   }
 
-  inSWV = adc12bit[offset];
+  inSWV  = adc12bit[offset];
   outSWV = dac12bit[offset];
+}
+
+static void startup_blink(void)
+{
+  for (uint32_t i = 0; i < 3U; i++)
+  {
+    HAL_GPIO_WritePin(GPIOB, LD2_Pin, GPIO_PIN_SET);
+    HAL_Delay(100);
+    HAL_GPIO_WritePin(GPIOB, LD2_Pin, GPIO_PIN_RESET);
+    HAL_Delay(100);
+  }
 }
 
 /* USER CODE END 0 */
@@ -180,8 +229,8 @@ int main(void)
   MX_USART3_UART_Init();
   MX_USB_OTG_FS_PCD_Init();
   MX_DAC_Init();
-  MX_TIM2_Init();
   MX_ADC1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   arm_float_to_q15((float32_t *)firCoeffs32, firCoeffsQ15, NUM_TAPS);
   arm_fir_init_q15(&firQ15, NUM_TAPS, firCoeffsQ15, firStateQ15, AUDIO_BLOCK_SIZE);
@@ -382,6 +431,7 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 0 */
 
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
   /* USER CODE BEGIN TIM2_Init 1 */
@@ -391,8 +441,14 @@ static void MX_TIM2_Init(void)
   htim2.Init.Prescaler = 83;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim2.Init.Period = 124;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -602,7 +658,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
@@ -621,8 +676,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
